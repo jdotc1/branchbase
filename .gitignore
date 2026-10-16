@@ -9,6 +9,9 @@ dist/
 # Go
 vendor/
 go.work
+coverage.out
+coverage/
+coverage
 
 # Rust
 target/
@@ -28,6 +31,10 @@ Thumbs.db
 .branchbase/cache/
 .branchbase/last-risk-report.json
 *.log
+.branchbase.json
+.branchbase.yaml
+.branchbase.yml
+
 
 # Environment variables
 .env
