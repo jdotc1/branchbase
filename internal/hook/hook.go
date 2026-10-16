@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -124,7 +125,9 @@ func installSingleHook(hookPath, hookName string) error {
 		return err
 	}
 	// Explicitly set executable bit: on Unix, os.WriteFile does not alter permissions on existing files
-	_ = os.Chmod(hookPath, 0755)
+	if err := os.Chmod(hookPath, 0755); err != nil && !os.IsNotExist(err) && runtime.GOOS != "windows" {
+		return fmt.Errorf("failed to make hook executable: %w", err)
+	}
 	return nil
 }
 
@@ -164,10 +167,15 @@ func UninstallHooks(repoPath string) error {
 		cleaned = strings.TrimSpace(cleaned)
 
 		if cleaned == "#!/bin/sh" || cleaned == "" {
-			_ = os.Remove(hookFile)
+			if err := os.Remove(hookFile); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("failed to remove cleaned hook file %s: %w", hookFile, err)
+			}
 		} else {
-			if err := os.WriteFile(hookFile, []byte(cleaned+"\n"), 0755); err == nil {
-				_ = os.Chmod(hookFile, 0755)
+			if err := os.WriteFile(hookFile, []byte(cleaned+"\n"), 0755); err != nil {
+				return fmt.Errorf("failed to write cleaned hook file %s: %w", hookFile, err)
+			}
+			if err := os.Chmod(hookFile, 0755); err != nil && !os.IsNotExist(err) && runtime.GOOS != "windows" {
+				return fmt.Errorf("failed to chmod cleaned hook file %s: %w", hookFile, err)
 			}
 		}
 	}

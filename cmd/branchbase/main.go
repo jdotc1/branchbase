@@ -573,7 +573,9 @@ func runProxy(cwd string, configPath ...string) {
 	<-sigChan
 
 	fmt.Println("\nShutting down BranchBase proxy...")
-	_ = server.Stop()
+	if err := server.Stop(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error stopping proxy: %v\n", err)
+	}
 }
 
 func runList(cwd string, jsonOutput bool, configPath ...string) {
@@ -919,8 +921,12 @@ func logHookError(cwd, msg string) {
 	logLine := fmt.Sprintf("[%s] %s\n", time.Now().Format(time.RFC3339), msg)
 	f, err := os.OpenFile(filepath.Join(cwd, ".branchbase.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err == nil {
-		_, _ = f.WriteString(logLine)
-		if err := f.Close(); err != nil { fmt.Fprintf(os.Stderr, "failed to close f: %v\n", err) }
+		if _, writeErr := f.WriteString(logLine); writeErr != nil {
+			fmt.Fprintf(os.Stderr, "failed to write to hook log: %v\n", writeErr)
+		}
+		if err := f.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to close f: %v\n", err)
+		}
 	}
 }
 

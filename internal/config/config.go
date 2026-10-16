@@ -162,7 +162,7 @@ func (c *Config) SaveJSON(filePath string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filePath, bytes, 0644)
+	return os.WriteFile(filePath, bytes, 0600)
 }
 
 // DatabaseNameForBranch returns the target database identifier for a given branch.

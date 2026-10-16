@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -124,11 +125,11 @@ func ValidateBranchNameUnique(repoPath, branch string) error {
 	return nil
 }
 
-// ResolveLocalBranches returns all local branch names in the repository.
+// ResolveLocalBranchesContext returns all local branch names in the repository respecting context cancellation.
 // It delegates to 'git for-each-ref' to account for both loose and packed refs,
 // and falls back to inspecting .git/refs/heads and .git/packed-refs if git exec is unavailable.
-func ResolveLocalBranches(repoPath string) ([]string, error) {
-	cmd := exec.Command("git", "-C", repoPath, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+func ResolveLocalBranchesContext(ctx context.Context, repoPath string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "for-each-ref", "--format=%(refname:short)", "refs/heads")
 	out, err := cmd.Output()
 	if err == nil {
 		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
@@ -143,6 +144,11 @@ func ResolveLocalBranches(repoPath string) ([]string, error) {
 	}
 
 	return resolveLocalBranchesFromFS(repoPath)
+}
+
+// ResolveLocalBranches returns all local branch names in the repository.
+func ResolveLocalBranches(repoPath string) ([]string, error) {
+	return ResolveLocalBranchesContext(context.Background(), repoPath)
 }
 
 // resolveGitCommonDir returns the directory that holds shared refs (refs/heads,
@@ -232,13 +238,13 @@ func resolveLocalBranchesFromFS(repoPath string) ([]string, error) {
 	return branches, nil
 }
 
-// ResolveMergedBranches returns all local branch names that have been merged into defaultBranch.
-func ResolveMergedBranches(repoPath, defaultBranch string) ([]string, error) {
+// ResolveMergedBranchesContext returns all local branch names that have been merged into defaultBranch respecting context.
+func ResolveMergedBranchesContext(ctx context.Context, repoPath, defaultBranch string) ([]string, error) {
 	if defaultBranch == "" {
 		defaultBranch = "main"
 	}
 
-	cmd := exec.Command("git", "-C", repoPath, "branch", "--merged", defaultBranch)
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "branch", "--merged", defaultBranch)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to query merged branches for %s: %w", defaultBranch, err)
@@ -255,4 +261,9 @@ func ResolveMergedBranches(repoPath, defaultBranch string) ([]string, error) {
 		}
 	}
 	return merged, nil
+}
+
+// ResolveMergedBranches returns all local branch names that have been merged into defaultBranch.
+func ResolveMergedBranches(repoPath, defaultBranch string) ([]string, error) {
+	return ResolveMergedBranchesContext(context.Background(), repoPath, defaultBranch)
 }

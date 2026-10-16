@@ -231,7 +231,9 @@ func Run(ctx context.Context, repoPath, customConfig string) *DoctorReport {
 			Details: err.Error(),
 		})
 	} else {
-		_ = l.Close()
+		if err := l.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "doctor: failed to close listener: %v\n", err)
+		}
 		addCheck(CheckResult{
 			Name:    "Proxy Port",
 			Passed:  true,

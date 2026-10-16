@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -294,3 +295,26 @@ proxy:
 		t.Fatal("expected error when loading non-existent direct config path, got nil")
 	}
 }
+
+func TestSaveJSONPermissions(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	cfg := DefaultConfig()
+	jsonPath := filepath.Join(tempDir, ".branchbase.json")
+	if err := cfg.SaveJSON(jsonPath); err != nil {
+		t.Fatalf("SaveJSON failed: %v", err)
+	}
+
+	info, err := os.Stat(jsonPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+
+	// On POSIX systems, ensure permissions are strictly 0600 (not readable by other users)
+	if runtime.GOOS != "windows" {
+		if info.Mode().Perm() != 0600 {
+			t.Errorf("expected file mode 0600, got %o", info.Mode().Perm())
+		}
+	}
+}
+

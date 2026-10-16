@@ -1,8 +1,10 @@
 package git
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -330,3 +332,69 @@ func TestResolveCurrentBranchRebase(t *testing.T) {
 		t.Errorf("expected 'feature/checkout-v2', got %q", branch)
 	}
 }
+
+func TestValidateBranchNameUnique(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	gitDir := filepath.Join(tempDir, ".git")
+	headsDir := filepath.Join(gitDir, "refs", "heads")
+	if err := os.MkdirAll(headsDir, 0755); err != nil {
+		t.Fatalf("mkdir refs/heads: %v", err)
+	}
+
+	// Create branch files: "main" and "feat/order-pay"
+	featDir := filepath.Join(headsDir, "feat")
+	if err := os.MkdirAll(featDir, 0755); err != nil {
+		t.Fatalf("mkdir refs/heads/feat: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(headsDir, "main"), []byte("sha1\n"), 0644); err != nil {
+		t.Fatalf("write main: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(featDir, "order-pay"), []byte("sha2\n"), 0644); err != nil {
+		t.Fatalf("write order-pay: %v", err)
+	}
+
+	// Case 1: Validating the existing branch itself should succeed
+	if err := ValidateBranchNameUnique(tempDir, "feat/order-pay"); err != nil {
+		t.Errorf("expected feat/order-pay to be valid against itself, got: %v", err)
+	}
+
+	// Case 2: A different branch name that sanitizes to the SAME identifier must FAIL
+	// "feat/order-pay" -> "feat_order_pay"
+	// "feat_order_pay" -> "feat_order_pay" (collision!)
+	err := ValidateBranchNameUnique(tempDir, "feat_order_pay")
+	if err == nil {
+		t.Fatal("expected collision error for 'feat_order_pay', got nil")
+	}
+	if !strings.Contains(err.Error(), "map to the same database identifier") {
+		t.Errorf("expected error message to explain collision, got: %v", err)
+	}
+
+	// Case 3: A genuinely unique branch should succeed
+	if err := ValidateBranchNameUnique(tempDir, "feature-new"); err != nil {
+		t.Errorf("expected unique branch to pass validation, got: %v", err)
+	}
+}
+
+func TestResolveLocalBranchesContext_Cancellation(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context
+
+	// Calling with canceled context should abort without hanging
+	_, _ = ResolveLocalBranchesContext(ctx, tempDir)
+}
+
+func TestResolveMergedBranchesContext_Cancellation(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _ = ResolveMergedBranchesContext(ctx, tempDir, "main")
+}
+
