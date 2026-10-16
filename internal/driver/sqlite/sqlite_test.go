@@ -281,6 +281,47 @@ func TestCreateBranchRefusesLiveWALAndSHMSidecars(t *testing.T) {
 }
 
 
+func TestDeleteBranchCleansJournalSidecar(t *testing.T) {
+	tempDir := t.TempDir()
+	basePath := filepath.Join(tempDir, "myapp_dev.db")
+
+	drv, err := New(Config{BasePath: basePath})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	ctx := context.Background()
+	createDummyDB(t, basePath)
+
+	// Create branch
+	branchName := "feature-journal-test"
+	if err := drv.CreateBranch(ctx, "main", branchName); err != nil {
+		t.Fatalf("CreateBranch failed: %v", err)
+	}
+
+	branchPath := filepath.Join(tempDir, "myapp_dev_feature_journal_test.db")
+	journalPath := branchPath + "-journal"
+	if err := os.WriteFile(journalPath, []byte("dummy-journal-data"), 0o644); err != nil {
+		t.Fatalf("failed to write dummy journal: %v", err)
+	}
+
+	// Delete branch
+	if err := drv.DeleteBranch(ctx, branchName); err != nil {
+		t.Fatalf("DeleteBranch failed: %v", err)
+	}
+
+	// Journal should be cleaned up
+	if _, err := os.Stat(journalPath); !os.IsNotExist(err) {
+		t.Fatalf("expected -journal file to be deleted by DeleteBranch, but it still exists (err=%v)", err)
+	}
+
+	// Recreating the branch should succeed cleanly
+	if err := drv.CreateBranch(ctx, "main", branchName); err != nil {
+		t.Fatalf("recreating branch failed due to leftover sidecar: %v", err)
+	}
+}
+
+
 func createDummyDB(t *testing.T, path string) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -294,3 +335,73 @@ func createDummyDB(t *testing.T, path string) {
 		t.Fatalf("failed to init mock db: %v", err)
 	}
 }
+
+func TestSqliteNewEmptyPath(t *testing.T) {
+	t.Parallel()
+	_, err := New(Config{BasePath: ""})
+	if err == nil {
+		t.Fatal("expected error on empty BasePath, got nil")
+	}
+}
+
+func TestSqliteRegistrationBaseDatabase(t *testing.T) {
+	t.Parallel()
+	drv, err := driver.GetDriver("sqlite", map[string]interface{}{
+		"base_database": "orders",
+	})
+	if err != nil {
+		t.Fatalf("failed to get sqlite driver: %v", err)
+	}
+	sDrv, ok := drv.(*SqliteDriver)
+	if !ok {
+		t.Fatalf("expected *SqliteDriver, got %T", drv)
+	}
+	if sDrv.cfg.BasePath != "orders.db" {
+		t.Errorf("expected BasePath 'orders.db', got %q", sDrv.cfg.BasePath)
+	}
+}
+
+func TestSqliteContextCancellation(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	basePath := filepath.Join(tempDir, "cancel_test.db")
+	createDummyDB(t, basePath)
+
+	drv, err := New(Config{BasePath: basePath})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	if err := drv.Ping(ctx); err == nil {
+		t.Error("expected error from Ping with cancelled context, got nil")
+	}
+	if _, err := drv.BranchExists(ctx, "feature"); err == nil {
+		t.Error("expected error from BranchExists with cancelled context, got nil")
+	}
+	if err := drv.CreateBranch(ctx, "main", "feature"); err == nil {
+		t.Error("expected error from CreateBranch with cancelled context, got nil")
+	}
+	if err := drv.DeleteBranch(ctx, "feature"); err == nil {
+		t.Error("expected error from DeleteBranch with cancelled context, got nil")
+	}
+	if _, err := drv.ListBranches(ctx); err == nil {
+		t.Error("expected error from ListBranches with cancelled context, got nil")
+	}
+}
+
+func TestSqlitePingDirectoryError(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	// BasePath is a directory, not a database file
+	drv, err := New(Config{BasePath: tempDir})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	if err := drv.Ping(context.Background()); err == nil {
+		t.Error("expected error when BasePath is a directory, got nil")
+	}
+}
+

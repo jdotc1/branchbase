@@ -1,14 +1,13 @@
 package mysql
 
 import (
-	"os"
-)
-import (
 	"context"
 	"database/sql"
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -357,8 +356,7 @@ func (d *MySQLDriver) CreateBranch(ctx context.Context, sourceBranch, targetBran
 			return fmt.Errorf("failed to fetch CREATE VIEW for %q: %w", v, err)
 		}
 		if createViewSQL.Valid {
-			rewrittenSQL := strings.ReplaceAll(createViewSQL.String, QuoteIdentifier(sourceDB)+".", QuoteIdentifier(targetDB)+".")
-			rewrittenSQL = strings.ReplaceAll(rewrittenSQL, sourceDB+".", targetDB+".")
+			rewrittenSQL := rewriteDatabaseReference(createViewSQL.String, sourceDB, targetDB)
 			if _, err := conn.ExecContext(ctx, rewrittenSQL); err != nil {
 				return fmt.Errorf("failed to create view %q in %q: %w", v, targetDB, err)
 			}
@@ -399,8 +397,7 @@ func (d *MySQLDriver) CreateBranch(ctx context.Context, sourceBranch, targetBran
 				return fmt.Errorf("failed to fetch CREATE TRIGGER for %q: %w", trg, err)
 			}
 			if origStmt.Valid {
-				rewrittenTrg := strings.ReplaceAll(origStmt.String, QuoteIdentifier(sourceDB)+".", QuoteIdentifier(targetDB)+".")
-				rewrittenTrg = strings.ReplaceAll(rewrittenTrg, sourceDB+".", targetDB+".")
+				rewrittenTrg := rewriteDatabaseReference(origStmt.String, sourceDB, targetDB)
 				if _, err := conn.ExecContext(ctx, rewrittenTrg); err != nil {
 					return fmt.Errorf("failed to create trigger %q in %q: %w", trg, targetDB, err)
 				}
@@ -409,6 +406,25 @@ func (d *MySQLDriver) CreateBranch(ctx context.Context, sourceBranch, targetBran
 	}
 
 	return nil
+}
+
+var definerPattern = regexp.MustCompile(`(?i)\bDEFINER\s*=\s*(?:` + "`[^`]+`|'[^']+'|[^\\s@]+)" + `@(?:` + "`[^`]+`|'[^']+'|[^\\s]+)")
+
+// rewriteDatabaseReference safely rewrites schema qualifications in MySQL views and triggers,
+// stripping DEFINER clauses and respecting identifier boundaries without corrupting literals.
+func rewriteDatabaseReference(stmt, sourceDB, targetDB string) string {
+	// Strip DEFINER clause so object executes with the privileges of the active session
+	cleaned := definerPattern.ReplaceAllString(stmt, "")
+
+	// 1. Rewrite backtick-quoted schema qualification: `sourceDB`.
+	quotedPattern := regexp.MustCompile("(?i)`" + regexp.QuoteMeta(sourceDB) + "`\\.")
+	cleaned = quotedPattern.ReplaceAllString(cleaned, QuoteIdentifier(targetDB)+".")
+
+	// 2. Rewrite unquoted schema qualification bounded by non-quote and non-ident boundaries:
+	unquotedPattern := regexp.MustCompile("(?i)(^|[^'\"`a-zA-Z0-9_])" + regexp.QuoteMeta(sourceDB) + `\.(` + "`?[a-zA-Z0-9_]+`?)")
+	cleaned = unquotedPattern.ReplaceAllString(cleaned, "${1}"+QuoteIdentifier(targetDB)+".${2}")
+
+	return cleaned
 }
 
 // DeleteBranch drops the specified branch database

@@ -78,6 +78,14 @@ func New(cfg Config) (*MongoDBDriver, error) {
 	}, nil
 }
 
+// NewWithClient returns a MongoDBDriver using an existing mongo.Client (useful for testing or shared pools).
+func NewWithClient(cfg Config, client *mongo.Client) *MongoDBDriver {
+	return &MongoDBDriver{
+		cfg:    cfg,
+		client: client,
+	}
+}
+
 func (d *MongoDBDriver) Name() string {
 	return "mongodb"
 }
@@ -99,10 +107,16 @@ func (d *MongoDBDriver) formatDBName(branchName string) string {
 }
 
 func (d *MongoDBDriver) Ping(ctx context.Context) error {
+	if d.client == nil {
+		return fmt.Errorf("mongodb client not initialized")
+	}
 	return d.client.Ping(ctx, nil)
 }
 
 func (d *MongoDBDriver) BranchExists(ctx context.Context, branchName string) (bool, error) {
+	if d.client == nil {
+		return false, fmt.Errorf("mongodb client not initialized")
+	}
 	dbName := d.formatDBName(branchName)
 	names, err := d.client.ListDatabaseNames(ctx, bson.M{"name": dbName})
 	if err != nil {
@@ -111,13 +125,29 @@ func (d *MongoDBDriver) BranchExists(ctx context.Context, branchName string) (bo
 	return len(names) > 0, nil
 }
 
-func (d *MongoDBDriver) CreateBranch(ctx context.Context, sourceBranch, targetBranch string) error {
+func (d *MongoDBDriver) CreateBranch(ctx context.Context, sourceBranch, targetBranch string) (retErr error) {
+	if d.client == nil {
+		return fmt.Errorf("mongodb client not initialized")
+	}
 	sourceDB := d.formatDBName(sourceBranch)
 	targetDB := d.formatDBName(targetBranch)
 
+	if sourceDB == targetDB {
+		return fmt.Errorf("source and target branch database names are identical: %q", sourceDB)
+	}
+
 	srcDb := d.client.Database(sourceDB)
 	targetDb := d.client.Database(targetDB)
-	
+
+	created := false
+	defer func() {
+		if retErr != nil && created {
+			dropCtx, dropCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer dropCancel()
+			_ = targetDb.Drop(dropCtx)
+		}
+	}()
+
 	colls, err := srcDb.ListCollectionNames(ctx, bson.M{})
 	if err != nil {
 		return fmt.Errorf("failed to list collections in source db %q: %w", sourceDB, err)
@@ -128,9 +158,10 @@ func (d *MongoDBDriver) CreateBranch(ctx context.Context, sourceBranch, targetBr
 		if strings.HasPrefix(collName, "system.") {
 			continue
 		}
+		created = true
 		srcColl := srcDb.Collection(collName)
 		targetColl := targetDb.Collection(collName)
-		
+
 		// Use aggregation $out to copy to the target database
 		pipeline := mongo.Pipeline{
 			bson.D{{Key: "$match", Value: bson.D{}}},
@@ -178,9 +209,13 @@ func (d *MongoDBDriver) CreateBranch(ctx context.Context, sourceBranch, targetBr
 					})
 				}
 			}
-			_ = idxCursor.Close(ctx)
+			if err := idxCursor.Close(ctx); err != nil {
+				return fmt.Errorf("failed to close index cursor on %q: %w", collName, err)
+			}
 			if len(indexModels) > 0 {
-				_, _ = targetColl.Indexes().CreateMany(ctx, indexModels)
+				if _, err := targetColl.Indexes().CreateMany(ctx, indexModels); err != nil {
+					return fmt.Errorf("failed to recreate indexes on %q: %w", collName, err)
+				}
 			}
 		}
 	}
@@ -188,6 +223,13 @@ func (d *MongoDBDriver) CreateBranch(ctx context.Context, sourceBranch, targetBr
 }
 
 func (d *MongoDBDriver) DeleteBranch(ctx context.Context, branchName string) error {
+	if d.client == nil {
+		return fmt.Errorf("mongodb client not initialized")
+	}
+	sanitized := git.SanitizeBranchName(branchName)
+	if d.isBaseBranch(sanitized) {
+		return fmt.Errorf("cannot delete protected base database %q", d.cfg.BaseDatabase)
+	}
 	dbName := d.formatDBName(branchName)
 	if dbName == d.cfg.BaseDatabase {
 		return fmt.Errorf("cannot delete protected base database %q", dbName)
@@ -196,6 +238,9 @@ func (d *MongoDBDriver) DeleteBranch(ctx context.Context, branchName string) err
 }
 
 func (d *MongoDBDriver) ListBranches(ctx context.Context) ([]driver.BranchInfo, error) {
+	if d.client == nil {
+		return nil, fmt.Errorf("mongodb client not initialized")
+	}
 	dbs, err := d.client.ListDatabases(ctx, bson.M{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list databases: %w", err)
@@ -230,6 +275,9 @@ func (d *MongoDBDriver) ListBranches(ctx context.Context) ([]driver.BranchInfo, 
 }
 
 func (d *MongoDBDriver) Close() error {
+	if d.client == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return d.client.Disconnect(ctx)

@@ -6,10 +6,20 @@ import (
 )
 
 func TestDriverRegistration(t *testing.T) {
-	// Reset registry for testing
+	// Backup registry and restore on test exit
 	registryMu.Lock()
+	oldRegistry := make(map[string]DriverFactory, len(registry))
+	for k, v := range registry {
+		oldRegistry[k] = v
+	}
 	registry = make(map[string]DriverFactory)
 	registryMu.Unlock()
+
+	defer func() {
+		registryMu.Lock()
+		registry = oldRegistry
+		registryMu.Unlock()
+	}()
 
 	Register("dummy", func(params map[string]interface{}) (Driver, error) {
 		if val, ok := params["fail"]; ok && val == true {

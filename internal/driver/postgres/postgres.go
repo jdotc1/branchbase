@@ -1,21 +1,18 @@
 package postgres
 
 import (
-	"os"
-)
-import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
-	"errors"
+	"github.com/branchbase/branchbase/internal/driver"
 	"github.com/branchbase/branchbase/internal/git"
 	"github.com/lib/pq"
-
-	"github.com/branchbase/branchbase/internal/driver"
 )
 
 // Config holds connection parameters for PostgreSQL

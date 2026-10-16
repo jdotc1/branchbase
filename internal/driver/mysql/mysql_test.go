@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -366,3 +367,34 @@ func TestNewWithPoolConfigInitializesPool(t *testing.T) {
 		t.Fatal("expected initialized *sql.DB, got nil")
 	}
 }
+
+func TestRewriteDatabaseReference(t *testing.T) {
+	sourceDB := "myapp"
+	targetDB := "myapp_feat_x"
+
+	viewSQL := "CREATE ALGORITHM=UNDEFINED DEFINER=`admin`@`%` SQL SECURITY DEFINER VIEW `myapp`.`user_v` AS select `u`.`id` AS `id`,`u`.`myapp_status` AS `myapp_status` from `myapp`.`users` `u` where `u`.`myapp.code` = 'myapp.value'"
+
+	got := rewriteDatabaseReference(viewSQL, sourceDB, targetDB)
+
+	// 1. DEFINER should be stripped
+	if strings.Contains(got, "DEFINER=`admin`@`%`") {
+		t.Errorf("expected DEFINER to be stripped, got: %s", got)
+	}
+
+	// 2. Schema qualifiers should be rewritten to targetDB
+	if !strings.Contains(got, "`myapp_feat_x`.`user_v`") {
+		t.Errorf("expected view name to be rewritten to targetDB, got: %s", got)
+	}
+	if !strings.Contains(got, "`myapp_feat_x`.`users`") {
+		t.Errorf("expected table name to be rewritten to targetDB, got: %s", got)
+	}
+
+	// 3. Column names and string literals containing sourceDB substring must NOT be corrupted
+	if !strings.Contains(got, "`myapp_status`") {
+		t.Errorf("expected `myapp_status` column to remain intact, got: %s", got)
+	}
+	if !strings.Contains(got, "'myapp.value'") {
+		t.Errorf("expected 'myapp.value' literal to remain intact, got: %s", got)
+	}
+}
+

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -210,6 +211,11 @@ func checkpointSQLite(ctx context.Context, databasePath string) error {
 		if err := db.Close(); err != nil { fmt.Fprintf(os.Stderr, "failed to close db: %v\n", err) } // Best effort close
 	}()
 
+	// Set busy_timeout so checkpointing doesn't fail prematurely if another connection is active
+	if _, err := db.ExecContext(ctx, "PRAGMA busy_timeout = 5000;"); err != nil {
+		log.Printf("[BranchBase SQLite] Warning: failed to set busy_timeout: %v", err)
+	}
+
 	// Execute TRUNCATE checkpoint
 	_, err = db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
 	if err != nil {
@@ -261,8 +267,11 @@ func (d *SqliteDriver) DeleteBranch(ctx context.Context, branchName string) erro
 	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete branch database %q: %w", targetPath, err)
 	}
-	_ = os.Remove(targetPath + "-wal")
-	_ = os.Remove(targetPath + "-shm")
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if err := os.Remove(targetPath + suffix); err != nil && !os.IsNotExist(err) {
+			log.Printf("[BranchBase SQLite] Warning: failed to clean up sidecar %s: %v", targetPath+suffix, err)
+		}
+	}
 
 	return nil
 }
