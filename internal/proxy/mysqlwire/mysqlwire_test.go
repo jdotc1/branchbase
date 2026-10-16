@@ -175,3 +175,93 @@ func TestReadPacketExceedsMaxHandshakePacketSize(t *testing.T) {
 		t.Fatalf("expected ErrPacketTooLarge error, got: %v", err)
 	}
 }
+
+func TestRewriteHandshakeResponse_LargeLenencAuthDoesNotPanic(t *testing.T) {
+	var buf bytes.Buffer
+	flags := ClientProtocol41 | ClientPluginAuthLenencClientData | ClientConnectWithDB
+
+	// 4 bytes flags
+	var f [4]byte
+	binary.LittleEndian.PutUint32(f[:], flags)
+	buf.Write(f[:])
+
+	// 4 bytes max packet + 1 byte charset + 23 bytes zeros
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x01})
+	buf.WriteByte(33)
+	buf.Write(make([]byte, 23))
+
+	// username
+	buf.WriteString("root\x00")
+
+	// 0xfe marker followed by 0x8000000000000000 (negative int64)
+	buf.WriteByte(0xfe)
+	var largeLen [8]byte
+	binary.LittleEndian.PutUint64(largeLen[:], 0x8000000000000000)
+	buf.Write(largeLen[:])
+
+	// Dummy db
+	buf.WriteString("testdb\x00")
+
+	packet := buf.Bytes()
+
+	// Should safely return an error without panicking
+	_, err := RewriteHandshakeResponseDatabase(packet, "newdb")
+	if err == nil {
+		t.Fatal("expected error on invalid packet with huge lenenc auth, got nil")
+	}
+}
+
+func TestValidateDatabaseIdentifier(t *testing.T) {
+	validNames := []string{
+		"valid_db",
+		"branch_123",
+		"feature-login",
+		"db",
+	}
+	for _, name := range validNames {
+		if err := ValidateDatabaseIdentifier(name); err != nil {
+			t.Errorf("expected valid identifier for %q, got err: %v", name, err)
+		}
+	}
+
+	invalidNames := []struct {
+		name string
+		desc string
+	}{
+		{"", "empty identifier"},
+		{"a_very_long_database_identifier_that_exceeds_sixty_four_characters_limit_12345", "exceeds 64 chars"},
+		{"db\x00injection", "null byte"},
+		{"db;DROP TABLE users", "semicolon"},
+		{"db/slash", "forward slash"},
+		{"db\\backslash", "backward slash"},
+	}
+	for _, tc := range invalidNames {
+		if err := ValidateDatabaseIdentifier(tc.name); err == nil {
+			t.Errorf("expected error for %s (%q), got nil", tc.desc, tc.name)
+		}
+	}
+}
+
+func FuzzRewriteHandshakeResponseDatabase(f *testing.F) {
+	// Seed with basic packets
+	f.Add([]byte{})
+	f.Add([]byte{0x00, 0x00, 0x00, 0x00})
+
+	// Seed with a valid packet structure
+	var buf bytes.Buffer
+	var fl [4]byte
+	binary.LittleEndian.PutUint32(fl[:], ClientProtocol41|ClientConnectWithDB)
+	buf.Write(fl[:])
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x01, 33})
+	buf.Write(make([]byte, 23))
+	buf.WriteString("root\x00")
+	buf.WriteString("pass\x00")
+	buf.WriteString("mydb\x00")
+	f.Add(buf.Bytes())
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Attempt rewrite on arbitrary input; it must never panic
+		_, _ = RewriteHandshakeResponseDatabase(data, "fuzz_db")
+	})
+}
+

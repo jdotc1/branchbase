@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -40,6 +41,8 @@ type Server struct {
 	activeMu        sync.Mutex
 	branchCheckMu   sync.Mutex
 	branchChecks    map[string]struct{}
+	provisionedMu   sync.RWMutex
+	provisioned     map[string]struct{}
 	tlsConfig       *tls.Config
 	drainTimeout    time.Duration
 }
@@ -59,6 +62,7 @@ func NewServer(cfg *config.Config, repoPath string, drv driver.Driver) *Server {
 		activeConns:     make(map[net.Conn]struct{}),
 		connectionSlots: make(chan struct{}, maxConcurrentConnections),
 		branchChecks:    make(map[string]struct{}),
+		provisioned:     make(map[string]struct{}),
 		drainTimeout:    500 * time.Millisecond,
 	}
 }
@@ -82,6 +86,14 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("server is already running")
 	}
 
+	if s.cfg != nil {
+		if s.cfg.Driver == "sqlite" || s.cfg.Driver == "mongodb" {
+			return fmt.Errorf("transparent wire proxy does not support %q driver (use 'branchbase switch' or environment variables instead)", s.cfg.Driver)
+		}
+		if s.cfg.Driver != "" && s.cfg.Driver != "postgres" && s.cfg.Driver != "mysql" && s.cfg.Driver != "mariadb" {
+			return fmt.Errorf("unsupported proxy driver %q: only postgres, mysql, and mariadb wire protocols are supported", s.cfg.Driver)
+		}
+	}
 
 	// Initialize TLS if enabled
 	if s.cfg.Proxy.TLS.Enabled {
@@ -90,6 +102,7 @@ func (s *Server) Start(ctx context.Context) error {
 			return fmt.Errorf("failed to setup TLS configuration: %w", err)
 		}
 		s.tlsConfig = tlsCfg
+		log.Printf("[BranchBase Proxy] ⚠️ Warning: TLS termination is enabled on the client side, but backend connections to %s are currently unencrypted (plaintext wire protocol).", s.cfg.Connection.Host)
 	}
 
 	var l net.Listener
@@ -314,34 +327,53 @@ func (s *Server) acceptLoop(ctx context.Context) {
 	}
 }
 
-func (s *Server) ensureBranchExists(targetBranch, defaultBranch string, optCtx ...context.Context) error {
+func (s *Server) ensureBranchExists(ctx context.Context, targetBranch, defaultBranch string) error {
 	if s.drv == nil {
 		return nil
 	}
+
+	// Fast-path: check in-memory cache without locking or driver query
+	s.provisionedMu.RLock()
+	if _, ok := s.provisioned[targetBranch]; ok {
+		s.provisionedMu.RUnlock()
+		return nil
+	}
+	s.provisionedMu.RUnlock()
+
+	// Slow-path: acquire keyed lock per target branch
 	if s.keyLock != nil {
 		unlock := s.keyLock.Lock(targetBranch)
 		defer unlock()
 	}
 
-	parentCtx := context.Background()
-	if len(optCtx) > 0 && optCtx[0] != nil {
-		parentCtx = optCtx[0]
+	// Double-check under lock
+	s.provisionedMu.RLock()
+	if _, ok := s.provisioned[targetBranch]; ok {
+		s.provisionedMu.RUnlock()
+		return nil
 	}
-	provCtx, provCancel := context.WithTimeout(parentCtx, 5*time.Second)
+	s.provisionedMu.RUnlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	provCtx, provCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer provCancel()
 	exists, err := s.drv.BranchExists(provCtx, targetBranch)
 	if err != nil {
 		return fmt.Errorf("failed to check branch existence for %q: %w", targetBranch, err)
 	}
-	if exists {
-		return nil
+	if !exists {
+		log.Printf("[BranchBase Proxy] 🪄 JIT provisioning database for branch %q from %q...", targetBranch, defaultBranch)
+		if err := s.drv.CreateBranch(provCtx, defaultBranch, targetBranch); err != nil {
+			return fmt.Errorf("failed to JIT provision branch %q: %w", targetBranch, err)
+		}
+		log.Printf("[BranchBase Proxy] ✅ JIT provisioned database for branch %q", targetBranch)
 	}
 
-	log.Printf("[BranchBase Proxy] 🪄 JIT provisioning database for branch %q from %q...", targetBranch, defaultBranch)
-	if err := s.drv.CreateBranch(provCtx, defaultBranch, targetBranch); err != nil {
-		return fmt.Errorf("failed to JIT provision branch %q: %w", targetBranch, err)
-	}
-	log.Printf("[BranchBase Proxy] ✅ JIT provisioned database for branch %q", targetBranch)
+	s.provisionedMu.Lock()
+	s.provisioned[targetBranch] = struct{}{}
+	s.provisionedMu.Unlock()
 	return nil
 }
 
@@ -353,25 +385,34 @@ func (s *Server) sendEarlyError(conn net.Conn, pgCode string, mysqlCode uint16, 
 	_, _ = conn.Write(pgwire.BuildErrorResponse("FATAL", pgCode, msg))
 }
 
-func (s *Server) dialBackend() (net.Conn, string, error) {
+func (s *Server) dialBackend(ctx context.Context) (net.Conn, string, error) {
+	var dialer net.Dialer
 	socketPath := s.cfg.Connection.SocketPath
 	if socketPath != "" {
-		conn, err := net.DialTimeout("unix", socketPath, 2*time.Second)
+		conn, err := dialer.DialContext(ctx, "unix", socketPath)
 		return conn, socketPath, err
 	}
 
 	host := s.cfg.Connection.Host
 	if strings.HasPrefix(host, "/") {
-		conn, err := net.DialTimeout("unix", host, 2*time.Second)
+		conn, err := dialer.DialContext(ctx, "unix", host)
 		return conn, host, err
 	}
 
 	backendAddr := net.JoinHostPort(host, fmt.Sprintf("%d", s.cfg.Connection.Port))
-	conn, err := net.DialTimeout("tcp", backendAddr, 2*time.Second)
+	conn, err := dialer.DialContext(ctx, "tcp", backendAddr)
 	return conn, backendAddr, err
 }
 
 func (s *Server) handleConnection(clientConn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[BranchBase Proxy] 💥 Recovered from connection panic: %v", r)
+			if err := clientConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				fmt.Fprintf(os.Stderr, "failed to close clientConn after panic: %v\n", err)
+			}
+		}
+	}()
 	defer func() { <-s.connectionSlots }()
 	rawClientConn := clientConn
 	if err := rawClientConn.SetDeadline(time.Now().Add(startupTimeout)); err != nil {
@@ -384,10 +425,13 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 		if err := rawClientConn.Close(); err != nil { fmt.Fprintf(os.Stderr, "failed to close rawClientConn: %v\n", err) }
 	}()
 
-	// 1. Resolve active Git branch
+	// 1. Resolve active Git branch (Fail-Closed)
 	activeBranch, err := git.ResolveCurrentBranch(s.repoPath)
 	if err != nil {
-		activeBranch = s.cfg.Proxy.DefaultBranch
+		log.Printf("[BranchBase Proxy] ❌ Failed to resolve active Git branch: %v", err)
+		errMsg := fmt.Sprintf("BranchBase: refusing connection because active Git branch could not be verified (%v).", err)
+		s.sendEarlyError(clientConn, "3D000", 1049, "42000", errMsg)
+		return
 	}
 	defaultBranch := s.cfg.Proxy.DefaultBranch
 	if defaultBranch == "" {
@@ -408,7 +452,7 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 
 	// 1b. JIT branch provisioning
 	if s.drv != nil && sanitizedBranch != git.SanitizeBranchName(defaultBranch) {
-		if err := s.ensureBranchExists(sanitizedBranch, defaultBranch, connCtx); err != nil {
+		if err := s.ensureBranchExists(connCtx, sanitizedBranch, defaultBranch); err != nil {
 			log.Printf("[BranchBase Proxy] ❌ JIT branch provisioning failed for %q: %v", sanitizedBranch, err)
 			errMsg := fmt.Sprintf("BranchBase: failed to provision database for branch %q: %v", sanitizedBranch, err)
 			s.sendEarlyError(clientConn, "3D000", 1049, "42000", errMsg)
@@ -419,7 +463,9 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	log.Printf("[BranchBase Proxy] Routing client connection -> Branch: %q (DB: %q)", activeBranch, targetDB)
 
 	// 2. Connect to backend database server
-	backendConn, backendAddr, err := s.dialBackend()
+	dialCtx, dialCancel := context.WithTimeout(connCtx, 2*time.Second)
+	backendConn, backendAddr, err := s.dialBackend(dialCtx)
+	dialCancel()
 	if err != nil {
 		log.Printf("[BranchBase Proxy] ❌ Failed to connect to backend %s: %v", backendAddr, err)
 		errMsg := fmt.Sprintf("BranchBase: failed to connect to database backend %s: %v", backendAddr, err)

@@ -22,6 +22,7 @@ type mockDriver struct {
 	mu          sync.Mutex
 	branches    map[string]bool
 	createCalls int
+	existsCalls int
 	createDelay time.Duration
 	createErr   error
 	existsErr   error
@@ -40,6 +41,7 @@ func (m *mockDriver) Close() error { return nil }
 func (m *mockDriver) BranchExists(ctx context.Context, branchName string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.existsCalls++
 	if m.existsErr != nil {
 		return false, m.existsErr
 	}
@@ -80,6 +82,19 @@ func (m *mockDriver) ListBranches(ctx context.Context) ([]driver.BranchInfo, err
 		list = append(list, driver.BranchInfo{Name: b, Database: b})
 	}
 	return list, nil
+}
+
+func createFakeGitRepo(t *testing.T, branch string) string {
+	t.Helper()
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0755); err != nil {
+		t.Fatalf("failed to create fake .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/"+branch+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write fake HEAD: %v", err)
+	}
+	return dir
 }
 
 func TestServerLifecycle(t *testing.T) {
@@ -269,12 +284,38 @@ func TestProxyEnsureBranchExists_AlreadyExists(t *testing.T) {
 	drv.branches["feature-existing"] = true
 
 	srv := NewServer(&cfg, t.TempDir(), drv)
-	if err := srv.ensureBranchExists("feature-existing", "main"); err != nil {
+	ctx := context.Background()
+	if err := srv.ensureBranchExists(ctx, "feature-existing", "main"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	if drv.createCalls != 0 {
 		t.Fatalf("expected 0 CreateBranch calls for existing branch, got %d", drv.createCalls)
+	}
+}
+
+func TestProxyEnsureBranchExists_FastPath(t *testing.T) {
+	cfg := config.DefaultConfig()
+	drv := newMockDriver()
+	drv.branches["feature-cached"] = true
+
+	srv := NewServer(&cfg, t.TempDir(), drv)
+	ctx := context.Background()
+
+	// First call should check driver
+	if err := srv.ensureBranchExists(ctx, "feature-cached", "main"); err != nil {
+		t.Fatalf("first call failed: %v", err)
+	}
+	if drv.existsCalls != 1 {
+		t.Fatalf("expected 1 exists call on first check, got %d", drv.existsCalls)
+	}
+
+	// Second call should hit in-memory Fast-Path cache without querying driver
+	if err := srv.ensureBranchExists(ctx, "feature-cached", "main"); err != nil {
+		t.Fatalf("second call failed: %v", err)
+	}
+	if drv.existsCalls != 1 {
+		t.Fatalf("expected fast-path to prevent second driver check, but existsCalls was %d", drv.existsCalls)
 	}
 }
 
@@ -285,7 +326,8 @@ func TestProxyEnsureBranchExists_ErrorPropagation(t *testing.T) {
 	drv.existsErr = expectedErr
 
 	srv := NewServer(&cfg, t.TempDir(), drv)
-	err := srv.ensureBranchExists("feature-err", "main")
+	ctx := context.Background()
+	err := srv.ensureBranchExists(ctx, "feature-err", "main")
 	if err == nil {
 		t.Fatal("expected error from ensureBranchExists when BranchExists fails, got nil")
 	}
@@ -300,7 +342,8 @@ func TestProxyEnsureBranchExists_ProvisionsWhenMissing(t *testing.T) {
 	drv := newMockDriver()
 
 	srv := NewServer(&cfg, t.TempDir(), drv)
-	if err := srv.ensureBranchExists("feature-new", "main"); err != nil {
+	ctx := context.Background()
+	if err := srv.ensureBranchExists(ctx, "feature-new", "main"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -318,6 +361,7 @@ func TestProxyEnsureBranchExists_ConcurrentSameBranch(t *testing.T) {
 	drv.createDelay = 15 * time.Millisecond // Simulate database clone latency
 
 	srv := NewServer(&cfg, t.TempDir(), drv)
+	ctx := context.Background()
 
 	const n = 20
 	var wg sync.WaitGroup
@@ -327,7 +371,7 @@ func TestProxyEnsureBranchExists_ConcurrentSameBranch(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			errCh <- srv.ensureBranchExists("feature-race", "main")
+			errCh <- srv.ensureBranchExists(ctx, "feature-race", "main")
 		}()
 	}
 
@@ -364,7 +408,7 @@ func TestProxyEnsureBranchExists_ConcurrentDifferentBranches(t *testing.T) {
 		branch := fmt.Sprintf("feature-%d", i)
 		go func(b string) {
 			defer wg.Done()
-			errCh <- srv.ensureBranchExists(b, "main")
+			errCh <- srv.ensureBranchExists(context.Background(), b, "main")
 		}(branch)
 	}
 
@@ -512,7 +556,7 @@ func TestHandleConnectionSendsErrorResponseOnDialFailure(t *testing.T) {
 	cfg.Connection.Host = "127.0.0.1"
 	cfg.Connection.Port = 59999 // Backend not listening
 
-	srv := NewServer(&cfg, t.TempDir(), nil)
+	srv := NewServer(&cfg, createFakeGitRepo(t, "main"), nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -583,7 +627,7 @@ func TestProxyHandleConnection_CancelRequestForwarded(t *testing.T) {
 	cfg.Connection.Host = "127.0.0.1"
 	cfg.Connection.Port = backendPort
 
-	srv := NewServer(&cfg, t.TempDir(), nil)
+	srv := NewServer(&cfg, createFakeGitRepo(t, "main"), nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -668,7 +712,7 @@ func TestProxyHandleMySQLHandshakeInterception(t *testing.T) {
 	cfg.Connection.Port = backendPort
 	cfg.Connection.BaseDatabase = "myapp_dev"
 
-	srv := NewServer(&cfg, t.TempDir(), nil)
+	srv := NewServer(&cfg, createFakeGitRepo(t, "main"), nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -757,11 +801,12 @@ func TestProxyHandleMySQLHandshakeFailClosedOnMalformedPayload(t *testing.T) {
 	// 2. Start Proxy with MySQL driver
 	cfg := config.DefaultConfig()
 	cfg.Driver = "mysql"
+	cfg.Proxy.ListenPort = 0
 	cfg.Connection.Host = backendHost
 	cfg.Connection.Port = backendPort
 	cfg.Connection.BaseDatabase = "myapp_dev"
 
-	srv := NewServer(&cfg, t.TempDir(), nil)
+	srv := NewServer(&cfg, createFakeGitRepo(t, "main"), nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -799,4 +844,82 @@ func TestProxyHandleMySQLHandshakeFailClosedOnMalformedPayload(t *testing.T) {
 		t.Fatalf("expected MySQL ERR packet (0xFF), got: 0x%X", errPkt[0])
 	}
 }
+
+func TestProxyServer_RejectUnsupportedDrivers(t *testing.T) {
+	driversToTest := []struct {
+		driverName string
+		wantErrSub string
+	}{
+		{"sqlite", "does not support \"sqlite\" driver"},
+		{"mongodb", "does not support \"mongodb\" driver"},
+		{"oracle", "unsupported proxy driver \"oracle\""},
+	}
+
+	for _, tt := range driversToTest {
+		t.Run(tt.driverName, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.Driver = tt.driverName
+			cfg.Proxy.ListenPort = 0
+			srv := NewServer(&cfg, t.TempDir(), nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			err := srv.Start(ctx)
+			if err == nil {
+				_ = srv.Stop()
+				t.Fatalf("expected Start to fail for driver %q, but got nil", tt.driverName)
+			}
+			if !bytes.Contains([]byte(err.Error()), []byte(tt.wantErrSub)) {
+				t.Fatalf("error %q does not contain expected substring %q", err.Error(), tt.wantErrSub)
+			}
+		})
+	}
+}
+
+func TestProxy_FailClosedOnGitResolutionFailure(t *testing.T) {
+	// Point to empty temp dir without .git, ensuring git.ResolveCurrentBranch fails
+	nonGitDir := t.TempDir()
+
+	cfg := config.DefaultConfig()
+	cfg.Driver = "postgres"
+	cfg.Proxy.ListenPort = 0
+	cfg.Proxy.DefaultBranch = "main"
+	cfg.Connection.Host = "127.0.0.1"
+	cfg.Connection.Port = 59999
+
+	srv := NewServer(&cfg, nonGitDir, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("Server.Start failed: %v", err)
+	}
+	defer func() { _ = srv.Stop() }()
+
+	addr := listenerAddr(srv)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial proxy listener at %s: %v", addr, err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	// Proxy should send an early ErrorResponse because git resolution failed, and NOT connect to main
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		t.Fatalf("failed to read early error packet: %v", err)
+	}
+	if header[0] != 'E' {
+		t.Fatalf("got packet type %c, want 'E' (ErrorResponse)", header[0])
+	}
+	length := binary.BigEndian.Uint32(header[1:5])
+	body := make([]byte, length-4)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		t.Fatalf("failed to read error body: %v", err)
+	}
+	if !bytes.Contains(body, []byte("active Git branch could not be verified")) {
+		t.Fatalf("expected error message to explain Git branch resolution failure, got: %q", body)
+	}
+}
+
 

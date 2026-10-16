@@ -103,8 +103,30 @@ func IsSSLRequest(payload []byte) bool {
 	return (flags & ClientSSL) != 0
 }
 
+// ValidateDatabaseIdentifier ensures the database identifier adheres to MySQL naming rules
+// and does not contain dangerous characters like null bytes, control chars, slashes, or semicolons.
+func ValidateDatabaseIdentifier(name string) error {
+	if name == "" {
+		return errors.New("database identifier cannot be empty")
+	}
+	if len(name) > 64 {
+		return errors.New("database identifier exceeds maximum length of 64 characters")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c == 0 || c == '/' || c == '\\' || c == ';' || c < 32 || c == 127 {
+			return fmt.Errorf("database identifier contains invalid character '%c'", c)
+		}
+	}
+	return nil
+}
+
 // RewriteHandshakeResponseDatabase rewrites or injects the target database schema in a MySQL HandshakeResponse41 packet.
 func RewriteHandshakeResponseDatabase(payload []byte, targetDB string) ([]byte, error) {
+	if err := ValidateDatabaseIdentifier(targetDB); err != nil {
+		return nil, fmt.Errorf("invalid target database identifier: %w", err)
+	}
+
 	if len(payload) < 32 {
 		return nil, ErrPacketTooShort
 	}
@@ -159,10 +181,17 @@ func RewriteHandshakeResponseDatabase(payload []byte, targetDB string) ([]byte, 
 			if idx+8 > len(payload) {
 				return nil, ErrInvalidPacket
 			}
-			authLen = int(binary.LittleEndian.Uint64(payload[idx:]))
+			rawLen := binary.LittleEndian.Uint64(payload[idx:])
 			idx += 8
+			if rawLen > uint64(len(payload)-idx) {
+				return nil, fmt.Errorf("%w: auth length exceeds remaining payload", ErrInvalidPacket)
+			}
+			authLen = int(rawLen)
 		default:
 			authLen = int(firstByte)
+		}
+		if authLen < 0 || authLen > len(payload)-idx {
+			return nil, ErrInvalidPacket
 		}
 		idx += authLen
 	} else if flags&ClientSecureConnection != 0 {
@@ -171,6 +200,9 @@ func RewriteHandshakeResponseDatabase(payload []byte, targetDB string) ([]byte, 
 		}
 		authLen := int(payload[idx])
 		idx++
+		if authLen > len(payload)-idx {
+			return nil, ErrInvalidPacket
+		}
 		idx += authLen
 	} else {
 		authEnd := bytes.IndexByte(payload[idx:], 0)
