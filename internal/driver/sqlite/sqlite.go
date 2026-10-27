@@ -93,6 +93,8 @@ func (d *SqliteDriver) Ping(ctx context.Context) error {
 			return fmt.Errorf("sqlite database file %q unreadable: %w", basePath, err)
 		}
 		if err := f.Close(); err != nil { fmt.Fprintf(os.Stderr, "failed to close f: %v\n", err) }
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("sqlite database file %q inaccessible: %w", basePath, err)
 	}
 
 	return nil
