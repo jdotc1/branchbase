@@ -150,7 +150,7 @@ branchbase/
    * **MySQL / MariaDB:** Copies schemas and rows table by table (`CREATE TABLE ... LIKE`, `INSERT INTO ... SELECT`); concurrent writes to the source are not captured from a single transaction snapshot.
    * **MongoDB:** Uses the $out aggregation pipeline to clone collections and reconstructs indexes.
    * **SQLite:** Performs a filesystem reflink/clone (`clonefile()` or `FICLONE`) only when the source has no active WAL/SHM/journal sidecars; otherwise it refuses the snapshot until clients stop and the database is checkpointed.
-   * **Docker Compose:** Automatically inspects `docker-compose.yml` to configure database ports and credentials without manual input.
+   * **Docker Compose:** Automatically inspects `docker-compose.yml` to configure database ports and credentials without manual input. For MariaDB 10.6+ images, `MARIADB_*` variables take precedence over their legacy `MYSQL_*` aliases.
 4. **Transparent Routing:** When your backend app queries `localhost:5432`, the BranchBase proxy intercepts the connection, resolves the active branch database, and forwards traffic directly with sub-millisecond overhead.
 5. **Lifecycle Pruning:** Once a PR is merged into `main`, running `branchbase prune` removes the ephemeral database, freeing disk space.
 
